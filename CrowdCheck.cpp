@@ -29,9 +29,27 @@
 
 static const char* TAG = "CrowdCheck";
 
-// MAC 주소를 고유하게 저장하기 위한 컨테이너 및 뮤텍스
-std::set<std::string> discovered_macs;
+// 비트맵 최적화를 통한 고유 MAC 식별 (ESP32-Paxcounter 방식)
+// 65536 비트 = 2048 * 32비트 (총 8KB 메모리 사용)
+uint32_t seen_ids_map[2048] = {0}; 
+
+// 프로토콜별 기기 스캔 카운트
+int wifi_count = 0;
+int ble_count = 0;
+
 std::mutex mac_mutex;
+
+// 비트맵 조작 헬퍼 함수
+#define WORD_OFFSET(b) ((b) / 32)
+#define BIT_OFFSET(b) ((b) % 32)
+
+bool is_mac_seen(uint16_t id) {
+    return (seen_ids_map[WORD_OFFSET(id)] & (1UL << BIT_OFFSET(id))) != 0;
+}
+
+void mark_mac_seen(uint16_t id) {
+    seen_ids_map[WORD_OFFSET(id)] |= (1UL << BIT_OFFSET(id));
+}
 SemaphoreHandle_t ble_sync_sem;
 
 // ==========================================
@@ -56,14 +74,20 @@ void wifi_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
 
     // Type 0 (Management) & Subtype 4 (Probe Request)
     if (type_val == 0 && subtype_val == 4) {
-        char mac_str[18];
         uint8_t *mac = frame + 10; // Probe Request 프레임에서 Source Address 위치
 
-        snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
-                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+        // 로컬 관리(Random) 주소인지 확인. (첫 번째 바이트의 b1 비트가 1이어야 함)
+        // Public MAC(공유기, 스마트TV 등 고정 기기)은 필터링하여 제외합니다.
+        if (!(mac[0] & 0x02)) return;
+
+        // MAC 주소의 마지막 2바이트를 추출하여 16비트 ID로 변환
+        uint16_t id = (mac[4] << 8) | mac[5];
         
         std::lock_guard<std::mutex> lock(mac_mutex);
-        discovered_macs.insert(std::string(mac_str));
+        if (!is_mac_seen(id)) {
+            mark_mac_seen(id);
+            wifi_count++;
+        }
     }
 }
 
@@ -75,15 +99,20 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
     if (event->type == BLE_GAP_EVENT_DISC) {
         if (event->disc.rssi < RSSI_THRESHOLD) return 0;
         
-        char mac_str[18];
+        // 랜덤 주소(Random Address)인지 확인하여 고정 기기를 필터링합니다.
+        if (event->disc.addr.type != BLE_ADDR_RANDOM && event->disc.addr.type != BLE_ADDR_RANDOM_ID) return 0;
+
         const uint8_t *mac = event->disc.addr.val;
         
-        // NimBLE의 주소는 Little-endian으로 들어오므로 뒤집어서 출력합니다.
-        snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
-                 mac[5], mac[4], mac[3], mac[2], mac[1], mac[0]);
+        // NimBLE의 주소는 Little-endian이므로 mac[0], mac[1]이 가장 오른쪽(마지막) 2바이트입니다.
+        // 이를 16비트 ID로 변환합니다.
+        uint16_t id = (mac[1] << 8) | mac[0];
 
         std::lock_guard<std::mutex> lock(mac_mutex);
-        discovered_macs.insert(std::string(mac_str));
+        if (!is_mac_seen(id)) {
+            mark_mac_seen(id);
+            ble_count++;
+        }
     }
     return 0;
 }
@@ -178,17 +207,23 @@ extern "C" void app_main() {
         ESP_LOGI(TAG, "=== 전송 윈도우 진입 ===");
         
         mac_mutex.lock();
-        int crowd_count = discovered_macs.size();
-        discovered_macs.clear();
+        int current_wifi = wifi_count;
+        int current_ble = ble_count;
+        
+        // 데이터 초기화
+        memset(seen_ids_map, 0, sizeof(seen_ids_map));
+        wifi_count = 0;
+        ble_count = 0;
         mac_mutex.unlock();
 
-        ESP_LOGI(TAG, ">> 수집된 주변 유효 기기(사람) 수: %d", crowd_count);
-        ESP_LOGI(TAG, ">> 서버로 HTTP POST 전송 중... (Dummy)");
+        ESP_LOGI(TAG, ">> 수집된 주변 Wi-Fi 기기 수: %d", current_wifi);
+        ESP_LOGI(TAG, ">> 수집된 주변 BLE 기기 수: %d", current_ble);
+        ESP_LOGI(TAG, ">> 혼잡도 데이터 서버로 HTTP POST 전송 중... (Dummy)");
         
         // TODO: 정상적인 AP(공유기) 연결 및 HTTP 전송 로직 구현 공간
         // esp_wifi_connect();
         // vTaskDelay(pdMS_TO_TICKS(5000));
-        // send_http_post(crowd_count);
+        // send_http_post(current_wifi, current_ble);
         // esp_wifi_disconnect();
         
         // 서버 전송 및 연결을 위한 5초 대기 시뮬레이션
