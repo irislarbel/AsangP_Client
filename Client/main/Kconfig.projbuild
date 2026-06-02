@@ -1,0 +1,39 @@
+menu "AsangP Client Configuration"
+
+    config WIFI_SSID
+        string "Wi-Fi SSID"
+        default "AjouUniv_PRIVATE"
+        help
+            SSID of the target Wi-Fi network.
+
+    config WIFI_USER
+        string "WPA2-Enterprise Username (Optional)"
+        default ""
+        help
+            Username for WPA2-Enterprise (802.1x EAP). Leave empty for WPA2-PSK.
+
+    config WIFI_PASS
+        string "Wi-Fi Password"
+        default ""
+        help
+            Password for the Wi-Fi network.
+
+    config API_URL
+        string "Backend API URL"
+        default "https://eulhane.com/asangp/api/v1/congestion/"
+        help
+            Endpoint URL for sending congestion data.
+
+    config API_KEY
+        string "Backend API Key"
+        default ""
+        help
+            X-API-KEY header value for authorization.
+
+    config DEVICE_ID
+        string "Device ID"
+        default "ESP_NODE_01"
+        help
+            Unique identifier for this ESP32 scanner node.
+
+endmenu
