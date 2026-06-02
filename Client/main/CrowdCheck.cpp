@@ -200,16 +200,6 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
     const uint8_t *mac = event->disc.addr.val;
     int addr_type = event->disc.addr.type;
 
-    const char *type_str = "Unknown";
-    if (addr_type == BLE_ADDR_PUBLIC)
-      type_str = "Public (Fixed)";
-    else if (addr_type == BLE_ADDR_RANDOM)
-      type_str = "Random";
-    else if (addr_type == BLE_ADDR_PUBLIC_ID)
-      type_str = "Public ID";
-    else if (addr_type == BLE_ADDR_RANDOM_ID)
-      type_str = "Random ID";
-
     // 랜덤 주소(Random Address)인지 확인하여 고정 기기를 필터링합니다.
     if (addr_type != BLE_ADDR_RANDOM && addr_type != BLE_ADDR_RANDOM_ID)
       return 0;
@@ -423,6 +413,7 @@ extern "C" void app_main() {
 
   esp_netif_init();
   esp_event_loop_create_default();
+  esp_netif_create_default_wifi_sta();
 
   // 2. BLE (NimBLE) 초기화
   ble_sync_sem = xSemaphoreCreateBinary();
