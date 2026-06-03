@@ -1,1 +1,4 @@
 .DS_Store
+Client/sdkconfig.defaults
+build/
+**/build/

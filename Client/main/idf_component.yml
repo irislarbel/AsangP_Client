@@ -1,2 +1,3 @@
-dependencies:
-  espressif/cjson: "^1.7.18"
+## idf_component.yml is not used in ESP-IDF v4.4.
+## cJSON is a built-in component in v4.4 — no external dependency needed.
+## NimBLE is also built-in via Bluetooth menuconfig.
