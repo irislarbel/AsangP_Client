@@ -35,7 +35,6 @@
 #define esp_eap_client_set_ca_cert esp_wifi_sta_wpa2_ent_set_ca_cert
 #define esp_eap_client_set_ttls_phase2_method esp_wifi_sta_wpa2_ent_set_ttls_phase2_method
 #define esp_wifi_sta_enterprise_enable esp_wifi_sta_wpa2_ent_enable
-#define ESP_EAP_TTLS_PHASE2_PAP WPA2_ENT_TTLS_PAP
 #endif
 
 // ==========================================
