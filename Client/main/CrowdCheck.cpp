@@ -35,6 +35,7 @@
 #define esp_eap_client_set_ca_cert esp_wifi_sta_wpa2_ent_set_ca_cert
 #define esp_eap_client_set_ttls_phase2_method esp_wifi_sta_wpa2_ent_set_ttls_phase2_method
 #define esp_wifi_sta_enterprise_enable esp_wifi_sta_wpa2_ent_enable
+#define ESP_EAP_TTLS_PHASE2_PAP WPA2_ENT_TTLS_PAP
 #endif
 
 // ==========================================
@@ -63,8 +64,9 @@ int wifi_rssi_threshold = -70;
 int bt_rssi_threshold = -70;
 
 // 비트맵 최적화를 통한 고유 MAC 식별 (ESP32-Paxcounter 방식)
-// 65536 비트 = 2048 * 32비트 (총 8KB 메모리 사용)
-uint32_t seen_ids_map[2048] = {0};
+// 65536 비트 = 2048 * 32비트 (각 프로토콜별 8KB 메모리 사용)
+uint32_t seen_ids_map_wifi[2048] = {0};
+uint32_t seen_ids_map_ble[2048] = {0};
 
 // 프로토콜별 기기 스캔 카운트
 int wifi_count = 0;
@@ -79,12 +81,12 @@ std::mutex mac_mutex;
 #define WORD_OFFSET(b) ((b) / 32)
 #define BIT_OFFSET(b) ((b) % 32)
 
-bool is_mac_seen(uint16_t id) {
-  return (seen_ids_map[WORD_OFFSET(id)] & (1UL << BIT_OFFSET(id))) != 0;
+bool is_mac_seen(uint32_t* map, uint16_t id) {
+  return (map[WORD_OFFSET(id)] & (1UL << BIT_OFFSET(id))) != 0;
 }
 
-void mark_mac_seen(uint16_t id) {
-  seen_ids_map[WORD_OFFSET(id)] |= (1UL << BIT_OFFSET(id));
+void mark_mac_seen(uint32_t* map, uint16_t id) {
+  map[WORD_OFFSET(id)] |= (1UL << BIT_OFFSET(id));
 }
 SemaphoreHandle_t ble_sync_sem;
 
@@ -137,8 +139,8 @@ void wifi_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     uint16_t id = (mac[4] << 8) | mac[5];
 
     std::lock_guard<std::mutex> lock(mac_mutex);
-    if (!is_mac_seen(id)) {
-      mark_mac_seen(id);
+    if (!is_mac_seen(seen_ids_map_wifi, id)) {
+      mark_mac_seen(seen_ids_map_wifi, id);
       wifi_count++;
     } else {
       // 이미 이번 윈도우에서 탐지된 기기인 경우 중복 카운트 증가
@@ -151,6 +153,8 @@ void wifi_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
 // BLE 페이로드 필터링 (Apple 기기 중복 카운트 방지)
 // ==========================================
 bool is_valid_ble_payload(const uint8_t *data, uint8_t len) {
+  if (data == nullptr || len == 0) return true;
+
   int offset = 0;
   while (offset < len) {
     uint8_t ad_len = data[offset];
@@ -219,8 +223,8 @@ static int ble_gap_event_cb(struct ble_gap_event *event, void *arg) {
     uint16_t id = (mac[1] << 8) | mac[0];
 
     std::lock_guard<std::mutex> lock(mac_mutex);
-    if (!is_mac_seen(id)) {
-      mark_mac_seen(id);
+    if (!is_mac_seen(seen_ids_map_ble, id)) {
+      mark_mac_seen(seen_ids_map_ble, id);
       ble_count++;
     } else {
       // 이미 이번 윈도우에서 탐지된 기기인 경우 중복 카운트 증가
@@ -274,6 +278,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 }
 
 bool connect_wifi() {
+  extern const uint8_t wpa2_ca_pem_start[] asm("_binary_wpa2_ca_pem_start");
+  extern const uint8_t wpa2_ca_pem_end[]   asm("_binary_wpa2_ca_pem_end");
+
   wifi_event_group = xEventGroupCreate();
   esp_event_handler_instance_t instance_any_id;
   esp_event_handler_instance_t instance_got_ip;
@@ -285,7 +292,7 @@ bool connect_wifi() {
                                       &instance_got_ip);
 
   wifi_config_t wifi_config = {};
-  strncpy((char *)wifi_config.sta.ssid, WIFI_SSID,
+  strlcpy((char *)wifi_config.sta.ssid, WIFI_SSID,
           sizeof(wifi_config.sta.ssid));
 
   // WPA2-Enterprise (아이디/비밀번호) 방식인지, 일반 WPA2-PSK 방식인지 확인
@@ -293,9 +300,13 @@ bool connect_wifi() {
     ESP_LOGI(TAG, "WPA2-Enterprise (802.1x) 모드로 연결을 시도합니다.");
     esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
 
-    // 1. 서버 인증서 검증 건너뜀 (고객님, 인증서 문제가 100% 아닙니다!
-    // 이 코드가 있으면 ESP32는 서버에게 인증서 달라는 말 자체를 안 합니다.)
-    ESP_ERROR_CHECK(esp_eap_client_set_ca_cert(NULL, 0));
+    // 1. 서버 인증서 검증 활성화 (Evil Twin 방지)
+    unsigned int ca_pem_bytes = wpa2_ca_pem_end - wpa2_ca_pem_start;
+    esp_err_t cert_err = esp_eap_client_set_ca_cert(wpa2_ca_pem_start, ca_pem_bytes);
+    if (cert_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to set WPA2 Enterprise CA certificate: %s", esp_err_to_name(cert_err));
+        return false; // 인증서 설정 실패 시 연결 취소
+    }
 
     // 2. 고객님 요청대로 TTLS/PEAP 강제 지정을 완전히 삭제했습니다!
     // 이렇게 하면 아이폰처럼 공유기가 던져주는 방식을 그대로 받아들입니다(자동
@@ -333,7 +344,7 @@ bool connect_wifi() {
     ESP_ERROR_CHECK(esp_wifi_sta_enterprise_enable());
   } else {
     ESP_LOGI(TAG, "일반 WPA2-PSK 모드로 연결을 시도합니다.");
-    strncpy((char *)wifi_config.sta.password, WIFI_PASS,
+    strlcpy((char *)wifi_config.sta.password, WIFI_PASS,
             sizeof(wifi_config.sta.password));
     esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
   }
@@ -355,6 +366,7 @@ bool connect_wifi() {
     return true;
   } else {
     ESP_LOGE(TAG, "Wi-Fi Connection failed.");
+    esp_wifi_disconnect();
     return false;
   }
 }
@@ -408,7 +420,7 @@ esp_err_t _http_event_handle(esp_http_client_event_t *evt) {
 void send_congestion_data(int w_count, int b_count) {
   char post_data[200];
   snprintf(post_data, sizeof(post_data),
-           "{\"device_id\":\"%s\",\"wifi_count\":%d,\"bt_count\":%d}",
+           "{\"device_id\":\"%s\",\"wifi_count\":%d,\"ble_count\":%d}",
            DEVICE_ID, w_count, b_count);
 
   esp_http_client_config_t config = {};
@@ -454,6 +466,10 @@ extern "C" void app_main() {
 
   // 2. BLE (NimBLE) 초기화
   ble_sync_sem = xSemaphoreCreateBinary();
+  if (ble_sync_sem == NULL) {
+    ESP_LOGE(TAG, "Failed to create ble_sync_sem due to insufficient heap memory.");
+    return;
+  }
   ESP_ERROR_CHECK(esp_nimble_hci_and_controller_init());
   nimble_port_init();
   ble_hs_cfg.sync_cb = ble_on_sync;
@@ -469,12 +485,13 @@ extern "C" void app_main() {
   ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
 
-  // [핵심 해결책] AirCUVE MAC 주소 필터링(IoT 기기 차단) 우회
-  // ESP32의 제조사 MAC 주소(OUI)를 감지하고 끊어버리는 대학망 보안 정책을 우회하기 위해
-  // Apple(MacBook/iPhone)의 OUI(f4:0f:24)로 MAC 주소를 위장합니다.
-  uint8_t spoofed_mac[6] = {0xf4, 0x0f, 0x24, 0x11, 0x22, 0x33};
-  ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_STA, spoofed_mac));
-  ESP_LOGI(TAG, "Apple MAC Address Spoofing Applied.");
+  // 기기의 고유 팩토리 MAC 주소 복원
+  uint8_t factory_mac[6];
+  ESP_ERROR_CHECK(esp_read_mac(factory_mac, ESP_MAC_WIFI_STA));
+  ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_STA, factory_mac));
+  ESP_LOGI(TAG, "Device MAC set to factory value: %02x:%02x:%02x:%02x:%02x:%02x",
+           factory_mac[0], factory_mac[1], factory_mac[2],
+           factory_mac[3], factory_mac[4], factory_mac[5]);
 
   ESP_ERROR_CHECK(esp_wifi_start());
   ESP_LOGI(TAG, "Wi-Fi Stack Initialized.");
@@ -523,7 +540,8 @@ extern "C" void app_main() {
     int current_dropped_apple = dropped_apple_packet_count;
 
     // 데이터 초기화
-    memset(seen_ids_map, 0, sizeof(seen_ids_map));
+    memset(seen_ids_map_wifi, 0, sizeof(seen_ids_map_wifi));
+    memset(seen_ids_map_ble, 0, sizeof(seen_ids_map_ble));
     wifi_count = 0;
     ble_count = 0;
     filtered_wifi_count = 0;
