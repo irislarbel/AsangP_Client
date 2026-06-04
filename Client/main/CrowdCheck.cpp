@@ -4,6 +4,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <sys/time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -20,10 +21,10 @@
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 
+#include "esp_nimble_hci.h"
 #include "host/ble_hs.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
-#include "esp_nimble_hci.h"
 
 #if __has_include("esp_eap_client.h")
 #include "esp_eap_client.h"
@@ -33,7 +34,8 @@
 #define esp_eap_client_set_username esp_wifi_sta_wpa2_ent_set_username
 #define esp_eap_client_set_password esp_wifi_sta_wpa2_ent_set_password
 #define esp_eap_client_set_ca_cert esp_wifi_sta_wpa2_ent_set_ca_cert
-#define esp_eap_client_set_ttls_phase2_method esp_wifi_sta_wpa2_ent_set_ttls_phase2_method
+#define esp_eap_client_set_ttls_phase2_method                                  \
+  esp_wifi_sta_wpa2_ent_set_ttls_phase2_method
 #define esp_wifi_sta_enterprise_enable esp_wifi_sta_wpa2_ent_enable
 #endif
 
@@ -80,11 +82,11 @@ std::mutex mac_mutex;
 #define WORD_OFFSET(b) ((b) / 32)
 #define BIT_OFFSET(b) ((b) % 32)
 
-bool is_mac_seen(uint32_t* map, uint16_t id) {
+bool is_mac_seen(uint32_t *map, uint16_t id) {
   return (map[WORD_OFFSET(id)] & (1UL << BIT_OFFSET(id))) != 0;
 }
 
-void mark_mac_seen(uint32_t* map, uint16_t id) {
+void mark_mac_seen(uint32_t *map, uint16_t id) {
   map[WORD_OFFSET(id)] |= (1UL << BIT_OFFSET(id));
 }
 SemaphoreHandle_t ble_sync_sem;
@@ -152,7 +154,8 @@ void wifi_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
 // BLE 페이로드 필터링 (Apple 기기 중복 카운트 방지)
 // ==========================================
 bool is_valid_ble_payload(const uint8_t *data, uint8_t len) {
-  if (data == nullptr || len == 0) return true;
+  if (data == nullptr || len == 0)
+    return true;
 
   int offset = 0;
   while (offset < len) {
@@ -278,7 +281,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 
 bool connect_wifi() {
   extern const uint8_t wpa2_ca_pem_start[] asm("_binary_wpa2_ca_pem_start");
-  extern const uint8_t wpa2_ca_pem_end[]   asm("_binary_wpa2_ca_pem_end");
+  extern const uint8_t wpa2_ca_pem_end[] asm("_binary_wpa2_ca_pem_end");
 
   wifi_event_group = xEventGroupCreate();
   esp_event_handler_instance_t instance_any_id;
@@ -299,12 +302,23 @@ bool connect_wifi() {
     ESP_LOGI(TAG, "WPA2-Enterprise (802.1x) 모드로 연결을 시도합니다.");
     esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
 
+    // [중요] ESP32는 부팅 시 시간이 1970년으로 초기화되어 있습니다.
+    // 서버의 인증서(예: 2023년~2043년 유효)를 검증할 때, 현재 시간이 인증서
+    // 유효 기간 이전이라서 검증이 실패(BADCERT_FUTURE)하고 Wi-Fi가 끊어지게
+    // 됩니다(Reason 23). 이를 방지하기 위해 네트워크 연결 전에 시간을 인증서
+    // 유효 기간 내인 2024년으로 임의 설정합니다.
+    struct timeval tv = {.tv_sec = 1780501622,
+                         .tv_usec = 0}; // 2024-01-01 00:00:00 UTC
+    settimeofday(&tv, NULL);
+
     // 1. 서버 인증서 검증 활성화 (Evil Twin 방지)
     unsigned int ca_pem_bytes = wpa2_ca_pem_end - wpa2_ca_pem_start;
-    esp_err_t cert_err = esp_eap_client_set_ca_cert(wpa2_ca_pem_start, ca_pem_bytes);
+    esp_err_t cert_err =
+        esp_eap_client_set_ca_cert(wpa2_ca_pem_start, ca_pem_bytes);
     if (cert_err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set WPA2 Enterprise CA certificate: %s", esp_err_to_name(cert_err));
-        return false; // 인증서 설정 실패 시 연결 취소
+      ESP_LOGE(TAG, "Failed to set WPA2 Enterprise CA certificate: %s",
+               esp_err_to_name(cert_err));
+      return false; // 인증서 설정 실패 시 연결 취소
     }
 
     // 2. 고객님 요청대로 TTLS/PEAP 강제 지정을 완전히 삭제했습니다!
@@ -312,10 +326,11 @@ bool connect_wifi() {
     // 협상).
 
     // 3. 외부/내부 식별자 및 라우팅 설정
-    // 맥/아이폰에서 접속할 때 입력하시는 아이디(bsm0546@ajou.ac.kr)가 정확히 맞으므로,
-    // 도메인을 자르지 않고 입력하신 WIFI_USER를 그대로 Outer/Inner Identity에 모두 적용합니다.
-    ESP_LOGI(TAG, "=> Identity: [%s] (길이: %d)", WIFI_USER, strlen(WIFI_USER));
-    ESP_LOGI(TAG, "=> 입력된 비번 길이: %d", strlen(WIFI_PASS));
+    // 맥/아이폰에서 접속할 때 입력하시는 아이디(bsm0546@ajou.ac.kr)가 정확히
+    // 맞으므로, 도메인을 자르지 않고 입력하신 WIFI_USER를 그대로 Outer/Inner
+    // Identity에 모두 적용합니다. ESP_LOGI(TAG, "=> Identity: [%s] (길이:
+    // %zu)", WIFI_USER, strlen(WIFI_USER)); ESP_LOGI(TAG, "=> 입력된 비번 길이:
+    // %zu", strlen(WIFI_PASS));
 
     // Outer Identity (껍데기 아이디)
     ESP_ERROR_CHECK(
@@ -327,18 +342,21 @@ bool connect_wifi() {
     ESP_ERROR_CHECK(
         esp_eap_client_set_password((uint8_t *)WIFI_PASS, strlen(WIFI_PASS)));
 
-    // [중요] 최신 인증 서버들은 ClientHello에 SNI(Server Name Indication) 확장이 없으면
-    // 곧바로 연결을 끊어버리는 경우가 있습니다. (애플 기기들은 기본적으로 SNI를 포함합니다)
-    // 따라서 아주대학교 도메인을 SNI로 명시적으로 전송하도록 설정합니다.
-    // [수정] Mac 패킷에 SNI가 없으므로 서버가 예기치 않은 확장을 받고 끊었을 수 있습니다. 주석 처리합니다.
+    // [중요] 최신 인증 서버들은 ClientHello에 SNI(Server Name Indication)
+    // 확장이 없으면 곧바로 연결을 끊어버리는 경우가 있습니다. (애플 기기들은
+    // 기본적으로 SNI를 포함합니다) 따라서 아주대학교 도메인을 SNI로 명시적으로
+    // 전송하도록 설정합니다. [수정] Mac 패킷에 SNI가 없으므로 서버가 예기치
+    // 않은 확장을 받고 끊었을 수 있습니다. 주석 처리합니다.
     // ESP_ERROR_CHECK(esp_eap_client_set_domain_name("ajou.ac.kr"));
 
     // [출시용] 불필요한 디버그 로그 제거 완료
 
-    // v4.4에서는 EAP-TTLS는 지원하지만 내부 EAP(GTC) 모듈이 아예 존재하지 않습니다.
-    // 따라서 Phase 2를 EAP로 설정하면 서버가 GTC를 요구할 때 응답을 만들지 못하고 뻗습니다.
-    // AirCUVE 서버가 완벽하게 지원하는 안전한 대안인 PAP(비밀번호 전송) 방식으로 우회합니다.
-    ESP_ERROR_CHECK(esp_eap_client_set_ttls_phase2_method(ESP_EAP_TTLS_PHASE2_PAP));
+    // v4.4에서는 EAP-TTLS는 지원하지만 내부 EAP(GTC) 모듈이 아예 존재하지
+    // 않습니다. 따라서 Phase 2를 EAP로 설정하면 서버가 GTC를 요구할 때 응답을
+    // 만들지 못하고 뻗습니다. AirCUVE 서버가 완벽하게 지원하는 안전한 대안인
+    // PAP(비밀번호 전송) 방식으로 우회합니다.
+    ESP_ERROR_CHECK(
+        esp_eap_client_set_ttls_phase2_method(ESP_EAP_TTLS_PHASE2_PAP));
 
     ESP_ERROR_CHECK(esp_wifi_sta_enterprise_enable());
   } else {
@@ -419,7 +437,7 @@ esp_err_t _http_event_handle(esp_http_client_event_t *evt) {
 void send_congestion_data(int w_count, int b_count) {
   char post_data[200];
   snprintf(post_data, sizeof(post_data),
-           "{\"device_id\":\"%s\",\"wifi_count\":%d,\"ble_count\":%d}",
+           "{\"device_id\":\"%s\",\"wifi_count\":%d,\"bt_count\":%d}",
            DEVICE_ID, w_count, b_count);
 
   esp_http_client_config_t config = {};
@@ -466,7 +484,8 @@ extern "C" void app_main() {
   // 2. BLE (NimBLE) 초기화
   ble_sync_sem = xSemaphoreCreateBinary();
   if (ble_sync_sem == NULL) {
-    ESP_LOGE(TAG, "Failed to create ble_sync_sem due to insufficient heap memory.");
+    ESP_LOGE(TAG,
+             "Failed to create ble_sync_sem due to insufficient heap memory.");
     return;
   }
   ESP_ERROR_CHECK(esp_nimble_hci_and_controller_init());
@@ -488,9 +507,10 @@ extern "C" void app_main() {
   uint8_t factory_mac[6];
   ESP_ERROR_CHECK(esp_read_mac(factory_mac, ESP_MAC_WIFI_STA));
   ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_STA, factory_mac));
-  ESP_LOGI(TAG, "Device MAC set to factory value: %02x:%02x:%02x:%02x:%02x:%02x",
-           factory_mac[0], factory_mac[1], factory_mac[2],
-           factory_mac[3], factory_mac[4], factory_mac[5]);
+  ESP_LOGI(TAG,
+           "Device MAC set to factory value: %02x:%02x:%02x:%02x:%02x:%02x",
+           factory_mac[0], factory_mac[1], factory_mac[2], factory_mac[3],
+           factory_mac[4], factory_mac[5]);
 
   ESP_ERROR_CHECK(esp_wifi_start());
   ESP_LOGI(TAG, "Wi-Fi Stack Initialized.");

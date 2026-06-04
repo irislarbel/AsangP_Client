@@ -4,10 +4,15 @@
   "idf.openOcdConfigs": [
     "board/esp32-wrover-kit-3.3v.cfg"
   ],
+  "idf.port": "/dev/tty.usbserial-10",
+  "idf.currentSetup": "/Users/irislarbel/.espressif/esp-idf-v4.4/esp-idf-v4.4",
   "idf.customExtraVars": {
-    "IDF_TARGET": "esp32"
+    "IDF_TARGET": "esp32",
+    "IDF_PATH": "/Users/irislarbel/.espressif/esp-idf-v4.4/esp-idf-v4.4",
+    "IDF_PYTHON_ENV_PATH": "/Users/irislarbel/.espressif/python_env/idf4.4_py3.14_env"
   },
   "idf.flashType": "UART",
+  "clangd.path": "/Users/irislarbel/.espressif/tools/esp-clang/esp-20.1.1_20250829/esp-clang/bin/clangd",
   "clangd.arguments": [
     "--background-index",
     "--query-driver=**",
