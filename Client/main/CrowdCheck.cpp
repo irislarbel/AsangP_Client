@@ -4,6 +4,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <sys/time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -20,10 +21,10 @@
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 
+#include "esp_nimble_hci.h"
 #include "host/ble_hs.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
-#include "esp_nimble_hci.h"
 
 #if __has_include("esp_eap_client.h")
 #include "esp_eap_client.h"
@@ -33,7 +34,8 @@
 #define esp_eap_client_set_username esp_wifi_sta_wpa2_ent_set_username
 #define esp_eap_client_set_password esp_wifi_sta_wpa2_ent_set_password
 #define esp_eap_client_set_ca_cert esp_wifi_sta_wpa2_ent_set_ca_cert
-#define esp_eap_client_set_ttls_phase2_method esp_wifi_sta_wpa2_ent_set_ttls_phase2_method
+#define esp_eap_client_set_ttls_phase2_method                                  \
+  esp_wifi_sta_wpa2_ent_set_ttls_phase2_method
 #define esp_wifi_sta_enterprise_enable esp_wifi_sta_wpa2_ent_enable
 #endif
 
@@ -80,11 +82,11 @@ std::mutex mac_mutex;
 #define WORD_OFFSET(b) ((b) / 32)
 #define BIT_OFFSET(b) ((b) % 32)
 
-bool is_mac_seen(uint32_t* map, uint16_t id) {
+bool is_mac_seen(uint32_t *map, uint16_t id) {
   return (map[WORD_OFFSET(id)] & (1UL << BIT_OFFSET(id))) != 0;
 }
 
-void mark_mac_seen(uint32_t* map, uint16_t id) {
+void mark_mac_seen(uint32_t *map, uint16_t id) {
   map[WORD_OFFSET(id)] |= (1UL << BIT_OFFSET(id));
 }
 SemaphoreHandle_t ble_sync_sem;
@@ -152,7 +154,8 @@ void wifi_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
 // BLE 페이로드 필터링 (Apple 기기 중복 카운트 방지)
 // ==========================================
 bool is_valid_ble_payload(const uint8_t *data, uint8_t len) {
-  if (data == nullptr || len == 0) return true;
+  if (data == nullptr || len == 0)
+    return true;
 
   int offset = 0;
   while (offset < len) {
@@ -276,11 +279,43 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
   }
 }
 
-bool connect_wifi() {
+void setup_wifi_config() {
   extern const uint8_t wpa2_ca_pem_start[] asm("_binary_wpa2_ca_pem_start");
-  extern const uint8_t wpa2_ca_pem_end[]   asm("_binary_wpa2_ca_pem_end");
+  extern const uint8_t wpa2_ca_pem_end[] asm("_binary_wpa2_ca_pem_end");
 
+  wifi_config_t wifi_config = {};
+  strlcpy((char *)wifi_config.sta.ssid, WIFI_SSID,
+          sizeof(wifi_config.sta.ssid));
+
+  if (strlen(WIFI_USER) > 0) {
+    ESP_LOGI(TAG, "WPA2-Enterprise (802.1x) 모드로 연결을 시도합니다.");
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+
+    unsigned int ca_pem_bytes = wpa2_ca_pem_end - wpa2_ca_pem_start;
+    esp_err_t cert_err = esp_eap_client_set_ca_cert(wpa2_ca_pem_start, ca_pem_bytes);
+    if (cert_err != ESP_OK) {
+      ESP_LOGE(TAG, "Failed to set WPA2 Enterprise CA certificate: %s",
+               esp_err_to_name(cert_err));
+      return;
+    }
+
+    ESP_ERROR_CHECK(esp_eap_client_set_identity((uint8_t *)WIFI_USER, strlen(WIFI_USER)));
+    ESP_ERROR_CHECK(esp_eap_client_set_username((uint8_t *)WIFI_USER, strlen(WIFI_USER)));
+    ESP_ERROR_CHECK(esp_eap_client_set_password((uint8_t *)WIFI_PASS, strlen(WIFI_PASS)));
+    ESP_ERROR_CHECK(esp_eap_client_set_ttls_phase2_method(ESP_EAP_TTLS_PHASE2_PAP));
+    ESP_ERROR_CHECK(esp_wifi_sta_enterprise_enable());
+  } else {
+    ESP_LOGI(TAG, "일반 WPA2-PSK 모드로 연결을 시도합니다.");
+    strlcpy((char *)wifi_config.sta.password, WIFI_PASS,
+            sizeof(wifi_config.sta.password));
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+  }
+}
+
+bool connect_wifi() {
   wifi_event_group = xEventGroupCreate();
+  if (wifi_event_group == NULL) return false;
+
   esp_event_handler_instance_t instance_any_id;
   esp_event_handler_instance_t instance_got_ip;
   esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
@@ -290,62 +325,9 @@ bool connect_wifi() {
                                       &wifi_event_handler, NULL,
                                       &instance_got_ip);
 
-  wifi_config_t wifi_config = {};
-  strlcpy((char *)wifi_config.sta.ssid, WIFI_SSID,
-          sizeof(wifi_config.sta.ssid));
-
-  // WPA2-Enterprise (아이디/비밀번호) 방식인지, 일반 WPA2-PSK 방식인지 확인
   if (strlen(WIFI_USER) > 0) {
-    ESP_LOGI(TAG, "WPA2-Enterprise (802.1x) 모드로 연결을 시도합니다.");
-    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-
-    // 1. 서버 인증서 검증 활성화 (Evil Twin 방지)
-    unsigned int ca_pem_bytes = wpa2_ca_pem_end - wpa2_ca_pem_start;
-    esp_err_t cert_err = esp_eap_client_set_ca_cert(wpa2_ca_pem_start, ca_pem_bytes);
-    if (cert_err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to set WPA2 Enterprise CA certificate: %s", esp_err_to_name(cert_err));
-        return false; // 인증서 설정 실패 시 연결 취소
-    }
-
-    // 2. 고객님 요청대로 TTLS/PEAP 강제 지정을 완전히 삭제했습니다!
-    // 이렇게 하면 아이폰처럼 공유기가 던져주는 방식을 그대로 받아들입니다(자동
-    // 협상).
-
-    // 3. 외부/내부 식별자 및 라우팅 설정
-    // 맥/아이폰에서 접속할 때 입력하시는 아이디(bsm0546@ajou.ac.kr)가 정확히 맞으므로,
-    // 도메인을 자르지 않고 입력하신 WIFI_USER를 그대로 Outer/Inner Identity에 모두 적용합니다.
-    ESP_LOGI(TAG, "=> Identity: [%s] (길이: %d)", WIFI_USER, strlen(WIFI_USER));
-    ESP_LOGI(TAG, "=> 입력된 비번 길이: %d", strlen(WIFI_PASS));
-
-    // Outer Identity (껍데기 아이디)
-    ESP_ERROR_CHECK(
-        esp_eap_client_set_identity((uint8_t *)WIFI_USER, strlen(WIFI_USER)));
-
-    // Inner Identity (진짜 아이디)
-    ESP_ERROR_CHECK(
-        esp_eap_client_set_username((uint8_t *)WIFI_USER, strlen(WIFI_USER)));
-    ESP_ERROR_CHECK(
-        esp_eap_client_set_password((uint8_t *)WIFI_PASS, strlen(WIFI_PASS)));
-
-    // [중요] 최신 인증 서버들은 ClientHello에 SNI(Server Name Indication) 확장이 없으면
-    // 곧바로 연결을 끊어버리는 경우가 있습니다. (애플 기기들은 기본적으로 SNI를 포함합니다)
-    // 따라서 아주대학교 도메인을 SNI로 명시적으로 전송하도록 설정합니다.
-    // [수정] Mac 패킷에 SNI가 없으므로 서버가 예기치 않은 확장을 받고 끊었을 수 있습니다. 주석 처리합니다.
-    // ESP_ERROR_CHECK(esp_eap_client_set_domain_name("ajou.ac.kr"));
-
-    // [출시용] 불필요한 디버그 로그 제거 완료
-
-    // v4.4에서는 EAP-TTLS는 지원하지만 내부 EAP(GTC) 모듈이 아예 존재하지 않습니다.
-    // 따라서 Phase 2를 EAP로 설정하면 서버가 GTC를 요구할 때 응답을 만들지 못하고 뻗습니다.
-    // AirCUVE 서버가 완벽하게 지원하는 안전한 대안인 PAP(비밀번호 전송) 방식으로 우회합니다.
-    ESP_ERROR_CHECK(esp_eap_client_set_ttls_phase2_method(ESP_EAP_TTLS_PHASE2_PAP));
-
-    ESP_ERROR_CHECK(esp_wifi_sta_enterprise_enable());
-  } else {
-    ESP_LOGI(TAG, "일반 WPA2-PSK 모드로 연결을 시도합니다.");
-    strlcpy((char *)wifi_config.sta.password, WIFI_PASS,
-            sizeof(wifi_config.sta.password));
-    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    struct timeval tv = {.tv_sec = 1780501622, .tv_usec = 0};
+    settimeofday(&tv, NULL);
   }
 
   esp_wifi_connect();
@@ -370,24 +352,29 @@ bool connect_wifi() {
   }
 }
 
+struct HttpContext {
+  char output_buffer[512];
+  int output_len;
+};
+
 esp_err_t _http_event_handle(esp_http_client_event_t *evt) {
-  static char output_buffer[512];
-  static int output_len = 0;
+  HttpContext *ctx = (HttpContext *)evt->user_data;
+  if (!ctx) return ESP_OK;
 
   switch (evt->event_id) {
   case HTTP_EVENT_ON_DATA: {
     int copy_len = evt->data_len;
-    if (output_len + copy_len < sizeof(output_buffer)) {
-      memcpy(output_buffer + output_len, evt->data, copy_len);
-      output_len += copy_len;
+    if (ctx->output_len + copy_len < sizeof(ctx->output_buffer)) {
+      memcpy(ctx->output_buffer + ctx->output_len, evt->data, copy_len);
+      ctx->output_len += copy_len;
     }
   } break;
   case HTTP_EVENT_ON_FINISH:
-    output_buffer[output_len] = '\0';
-    ESP_LOGI(TAG, "HTTP Response: %s", output_buffer);
+    ctx->output_buffer[ctx->output_len] = '\0';
+    ESP_LOGI(TAG, "HTTP Response: %s", ctx->output_buffer);
 
-    if (output_len > 0) {
-      cJSON *json = cJSON_Parse(output_buffer);
+    if (ctx->output_len > 0) {
+      cJSON *json = cJSON_Parse(ctx->output_buffer);
       if (json != NULL) {
         cJSON *wifi_th =
             cJSON_GetObjectItemCaseSensitive(json, "wifi_rssi_threshold");
@@ -405,10 +392,13 @@ esp_err_t _http_event_handle(esp_http_client_event_t *evt) {
         cJSON_Delete(json);
       }
     }
-    output_len = 0;
+    ctx->output_len = 0;
     break;
   case HTTP_EVENT_DISCONNECTED:
-    output_len = 0;
+    ctx->output_len = 0;
+    break;
+  case HTTP_EVENT_ERROR:
+    ctx->output_len = 0;
     break;
   default:
     break;
@@ -419,13 +409,16 @@ esp_err_t _http_event_handle(esp_http_client_event_t *evt) {
 void send_congestion_data(int w_count, int b_count) {
   char post_data[200];
   snprintf(post_data, sizeof(post_data),
-           "{\"device_id\":\"%s\",\"wifi_count\":%d,\"ble_count\":%d}",
+           "{\"device_id\":\"%s\",\"wifi_count\":%d,\"bt_count\":%d}",
            DEVICE_ID, w_count, b_count);
+
+  HttpContext http_ctx = {};
 
   esp_http_client_config_t config = {};
   config.url = API_URL;
   config.event_handler = _http_event_handle;
   config.crt_bundle_attach = esp_crt_bundle_attach; // HTTPS 인증서 자동 검증
+  config.user_data = &http_ctx;
 
   esp_http_client_handle_t client = esp_http_client_init(&config);
   esp_http_client_set_method(client, HTTP_METHOD_POST);
@@ -466,7 +459,8 @@ extern "C" void app_main() {
   // 2. BLE (NimBLE) 초기화
   ble_sync_sem = xSemaphoreCreateBinary();
   if (ble_sync_sem == NULL) {
-    ESP_LOGE(TAG, "Failed to create ble_sync_sem due to insufficient heap memory.");
+    ESP_LOGE(TAG,
+             "Failed to create ble_sync_sem due to insufficient heap memory.");
     return;
   }
   ESP_ERROR_CHECK(esp_nimble_hci_and_controller_init());
@@ -488,11 +482,14 @@ extern "C" void app_main() {
   uint8_t factory_mac[6];
   ESP_ERROR_CHECK(esp_read_mac(factory_mac, ESP_MAC_WIFI_STA));
   ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_STA, factory_mac));
-  ESP_LOGI(TAG, "Device MAC set to factory value: %02x:%02x:%02x:%02x:%02x:%02x",
-           factory_mac[0], factory_mac[1], factory_mac[2],
-           factory_mac[3], factory_mac[4], factory_mac[5]);
+  ESP_LOGI(TAG,
+           "Device MAC set to factory value: %02x:%02x:%02x:%02x:%02x:%02x",
+           factory_mac[0], factory_mac[1], factory_mac[2], factory_mac[3],
+           factory_mac[4], factory_mac[5]);
 
   ESP_ERROR_CHECK(esp_wifi_start());
+  setup_wifi_config();
+  ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(&wifi_promiscuous_cb));
   ESP_LOGI(TAG, "Wi-Fi Stack Initialized.");
 
   // [부팅 시 1회 통신] 초기 임계값 설정을 받아오기 위해 서버에 더미 데이터 전송
@@ -512,7 +509,6 @@ extern "C" void app_main() {
 
       // --- Wi-Fi 스니핑 페이즈 ---
       ESP_LOGD(TAG, "Wi-Fi Sniffing On");
-      ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(&wifi_promiscuous_cb));
       ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
 
       vTaskDelay(pdMS_TO_TICKS(WIFI_SNIFF_DURATION_MS));

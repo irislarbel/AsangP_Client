@@ -2,7 +2,7 @@
   "configurations": [
     {
       "name": "ESP-IDF",
-      "compilerPath": "/Users/irislarbel/.espressif/tools/xtensa-esp-elf/esp-15.2.0_20251204/xtensa-esp-elf/bin/xtensa-esp32-elf-gcc",
+      "compilerPath": "/Users/irislarbel/.espressif/tools/xtensa-esp32-elf/esp-2021r2-patch5-8.4.0/xtensa-esp32-elf/bin/xtensa-esp32-elf-gcc",
       "compileCommands": "${config:idf.buildPath}/compile_commands.json",
       "intelliSenseMode": "gcc-x86",
       "includePath": [
